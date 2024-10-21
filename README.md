@@ -10,7 +10,6 @@ This project processes multiple video files of the same scene from different ang
 - Detects text in frames using Tesseract OCR
 - Adjusts brightness and contrast of frames for consistency
 - Holds on the best angle for a specified duration
-- Provides a progress bar for processing feedback
 
 ## Requirements
 
