@@ -16,6 +16,108 @@ def parse_arguments():
 mp_pose = mp.solutions.pose
 pose = mp_pose.Pose()
 
+def calculate_target_variables(frames):
+    """
+    Calculate the target brightness, contrast, hue, saturation, and gamma for a set of frames.
+    Returns a dictionary with target values for each video property.
+    """
+    brightness_list = []
+    contrast_list = []
+    hue_list = []
+    saturation_list = []
+    gamma_list = []
+
+    for frame in frames:
+        # Convert to LAB and HSV for brightness/contrast and hue/saturation
+        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+        # Brightness and contrast
+        l_channel, a, b = cv2.split(lab)
+        brightness = np.mean(l_channel)
+        contrast = np.std(l_channel)
+
+        brightness_list.append(brightness)
+        contrast_list.append(contrast)
+
+        # Hue and Saturation
+        h_channel, s_channel, v_channel = cv2.split(hsv)
+        hue = np.mean(h_channel)
+        saturation = np.mean(s_channel)
+
+        hue_list.append(hue)
+        saturation_list.append(saturation)
+
+        # Gamma estimation (assume luminance correlation for simplicity)
+        gamma_list.append(estimate_gamma(frame))
+
+    # Calculate the target as the average for each property
+    target_brightness = np.mean(brightness_list)
+    target_contrast = np.mean(contrast_list)
+    target_hue = np.mean(hue_list)
+    target_saturation = np.mean(saturation_list)
+    target_gamma = np.mean(gamma_list)
+
+    return {
+        'brightness': target_brightness,
+        'contrast': target_contrast,
+        'hue': target_hue,
+        'saturation': target_saturation,
+        'gamma': target_gamma
+    }
+
+def estimate_gamma(image):
+    """
+    Estimate the gamma value of an image based on its luminance.
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    mean_luminance = np.mean(gray)
+
+    # Use a heuristic for gamma estimation (assuming average luminance 127 is ideal for gamma 1.0)
+    gamma = np.log(mean_luminance / 255) / np.log(127 / 255)
+    return gamma
+
+
+def adjust_brightness_contrast(image, target_brightness, target_contrast, target_hue=0, target_saturation=1, gamma=1.0):
+    # Convert to LAB to adjust brightness and contrast
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    l_channel, a, b = cv2.split(lab)
+
+    # Adjust brightness
+    if target_brightness - np.mean(l_channel) < 0:
+        l_channel = cv2.add(l_channel, target_brightness - np.mean(l_channel))
+
+    # Adjust contrast
+    l_channel = cv2.multiply(l_channel, target_contrast / np.std(l_channel))
+
+    # Merge LAB channels back
+    lab_adjusted = cv2.merge((l_channel, a, b))
+
+    return cv2.cvtColor(lab_adjusted, cv2.COLOR_LAB2BGR)
+
+    bgr_adjusted = cv2.cvtColor(lab_adjusted, cv2.COLOR_LAB2BGR)
+
+    # Convert to HSV to adjust hue and saturation
+    hsv = cv2.cvtColor(bgr_adjusted, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
+
+    # Adjust hue (add a hue shift, target_hue can be small adjustments to hue)
+    # h = np.mod(h.astype(np.float32) + target_hue, 180).astype(np.uint8)
+
+    # Adjust saturation
+    # s = cv2.multiply(s.astype(np.float32), target_saturation).clip(0, 255).astype(np.uint8)
+
+    # Merge adjusted channels and convert back to BGR
+    hsv_adjusted = cv2.merge((h, s, v))
+    bgr_hsv_adjusted = cv2.cvtColor(hsv_adjusted, cv2.COLOR_HSV2BGR)
+
+    # Apply gamma correction
+    # if target_brightness - np.mean(l_channel) < 0:
+    gamma_correction = np.array(255 * (bgr_hsv_adjusted / 255) ** gamma, dtype='uint8')
+
+    return gamma_correction
+
+
 def detect_text(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     text = pytesseract.image_to_string(gray)
@@ -43,7 +145,7 @@ def centeredness_score(landmarks, frame_width, frame_height):
 def compute_score(landmarks, frame_width, frame_height):
     visibility = visibility_score(landmarks)
     centeredness = centeredness_score(landmarks, frame_width, frame_height)
-    return visibility * 0.4 + centeredness * 0.6  # Adjust weights if needed
+    return visibility * 0.7 + centeredness * 0.3  # Adjust weights if needed
 
 # Process the videos
 def process_videos(video_dir, output_path):
@@ -62,7 +164,25 @@ def process_videos(video_dir, output_path):
     total_frames = min(frame_counts)
     frame_duration = 1 / fps  # Duration of each frame in seconds
     hold_duration = 1  # Duration to hold the best angle in seconds
-    hold_frames = int(hold_duration / frame_duration)  # Number of frames 
+    hold_frames = int(hold_duration / frame_duration)  # Number of frames
+
+    sample_frames = []
+    for cap in video_caps:
+        ret, frame = cap.read()
+        if ret:
+            sample_frames.append(frame)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Reset to first frame
+
+    # Calculate target variables based on the sample frames
+    target_variables = calculate_target_variables(sample_frames)
+
+    # Use these target variables in your adjust_brightness_contrast function
+    target_brightness = target_variables['brightness']
+    target_contrast = target_variables['contrast']
+    target_hue = target_variables['hue']
+    target_saturation = target_variables['saturation']
+    target_gamma = target_variables['gamma']
+ 
 
     with tqdm(total=total_frames, desc="Processing Frames", unit="frame", ncols=100) as pbar:
         # Iterate over frames
@@ -75,7 +195,8 @@ def process_videos(video_dir, output_path):
                 # Continue using frames from the best video
                 ret, frame = video_caps[best_cap_idx].read()
                 if ret:
-                    output_video.write(frame)
+                    adjusted_frame = adjust_brightness_contrast(frame, target_brightness, target_contrast, target_hue, target_saturation, target_gamma)
+                    output_video.write(adjusted_frame)
                 hold_counter -= 1
             else:
                 best_score = -float('inf')
@@ -85,19 +206,27 @@ def process_videos(video_dir, output_path):
                     if not ret:
                         continue
 
+                    # adjusted_frame = adjust_brightness_contrast(frame, target_brightness, target_contrast)
                     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     results = pose.process(frame_rgb)
+                    score = 0
 
                     if results.pose_landmarks:
+                        # print(cap_idx)
+                        # print(1)
+                        # print(1, cap_idx)
                         landmarks = results.pose_landmarks.landmark
                         score = compute_score(landmarks, frame_widths[cap_idx], frame_heights[cap_idx])
 
-                        if score > best_score:
-                            best_score = score
-                            best_cap_idx = cap_idx
+                    
+                    # print(cap_idx, score)
+                    if score > best_score:
+                        best_score = score
+                        best_cap_idx = cap_idx
                 
                     if detect_text(frame):
-                        text_detected = True
+                        # print(2, cap_idx)
+                        # text_detected = True
                         best_cap_idx = cap_idx
                         break  # Exit the loop early if text is detected
 
@@ -106,8 +235,10 @@ def process_videos(video_dir, output_path):
                     video_caps[best_cap_idx].set(cv2.CAP_PROP_POS_FRAMES, i)  # Reset to the correct frame
                     ret, frame = video_caps[best_cap_idx].read()
                     if ret:
-                        output_video.write(frame)
-                        hold_counter = hold_frames if text_detected else hold_frames - 1  # Adjust hold counter
+                        adjusted_frame = adjust_brightness_contrast(frame, target_brightness, target_contrast, target_hue, target_saturation, target_gamma)
+                        # print(best_cap_idx)
+                        output_video.write(adjusted_frame)
+                        hold_counter = hold_frames - 1  # Adjust hold counter
 
             # Update tqdm progress bar
             pbar.update(1)
