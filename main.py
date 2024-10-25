@@ -16,6 +16,13 @@ def parse_arguments():
 mp_pose = mp.solutions.pose
 pose = mp_pose.Pose()
 
+def calculate_brightness_score(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    avg_brightness = np.mean(gray)
+    # Calculate the score based on brightness (higher brightness = higher score)
+    score = avg_brightness / 255  # Normalize to 0-1 range
+    return score
+
 def calculate_target_variables(frames):
     """
     Calculate the target brightness, contrast, hue, saturation, and gamma for a set of frames.
@@ -121,7 +128,7 @@ def adjust_brightness_contrast(image, target_brightness, target_contrast, target
 def detect_text(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     text = pytesseract.image_to_string(gray)
-    return len(text.strip()) > 0
+    return len(text.strip())
 
 # Function to calculate visibility score
 def visibility_score(landmarks):
@@ -142,10 +149,12 @@ def centeredness_score(landmarks, frame_width, frame_height):
     return 1 - (distance / max_distance)
 
 # Function to compute combined score
-def compute_score(landmarks, frame_width, frame_height):
+def compute_score(landmarks, frame_width, frame_height, frame, target_brightness):
     visibility = visibility_score(landmarks)
     centeredness = centeredness_score(landmarks, frame_width, frame_height)
-    return visibility * 0.7 + centeredness * 0.3  # Adjust weights if needed
+    brightness_score = calculate_brightness_score(frame)
+    text_score = detect_text(frame) / 100  # Normalize text score (assuming 100 characters is a good benchmark)
+    return visibility * 0.5 + centeredness * 0.2 + brightness_score * 0.6 + text_score * 1.2
 
 # Process the videos
 def process_videos(video_dir, output_path):
@@ -163,7 +172,7 @@ def process_videos(video_dir, output_path):
     # Track progress with tqdm
     total_frames = min(frame_counts)
     frame_duration = 1 / fps  # Duration of each frame in seconds
-    hold_duration = 1  # Duration to hold the best angle in seconds
+    hold_duration = 3  # Duration to hold the best angle in seconds
     hold_frames = int(hold_duration / frame_duration)  # Number of frames
 
     sample_frames = []
@@ -189,56 +198,39 @@ def process_videos(video_dir, output_path):
         hold_counter = 0
         best_cap_idx = None
         
-
         for i in range(total_frames):  # Loop through synced frames
             if hold_counter > 0:
                 # Continue using frames from the best video
-                ret, frame = video_caps[best_cap_idx].read()
-                if ret:
-                    adjusted_frame = adjust_brightness_contrast(frame, target_brightness, target_contrast, target_hue, target_saturation, target_gamma)
-                    output_video.write(adjusted_frame)
+                for cap_idx, cap in enumerate(video_caps):
+                    ret, frame = cap.read()
+                    if cap_idx == best_cap_idx and ret:
+                        adjusted_frame = adjust_brightness_contrast(frame, target_brightness, target_contrast, target_hue, target_saturation, target_gamma)
+                        output_video.write(adjusted_frame)
                 hold_counter -= 1
             else:
                 best_score = -float('inf')
-                text_detected = False
                 for cap_idx, cap in enumerate(video_caps):
                     ret, frame = cap.read()
                     if not ret:
                         continue
 
-                    # adjusted_frame = adjust_brightness_contrast(frame, target_brightness, target_contrast)
                     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     results = pose.process(frame_rgb)
                     score = 0
 
                     if results.pose_landmarks:
-                        # print(cap_idx)
-                        # print(1)
-                        # print(1, cap_idx)
                         landmarks = results.pose_landmarks.landmark
-                        score = compute_score(landmarks, frame_widths[cap_idx], frame_heights[cap_idx])
+                        score = compute_score(landmarks, frame_widths[cap_idx], frame_heights[cap_idx], frame, target_brightness)
 
-                    
-                    # print(cap_idx, score)
                     if score > best_score:
                         best_score = score
                         best_cap_idx = cap_idx
-                
-                    if detect_text(frame):
-                        # print(2, cap_idx)
-                        # text_detected = True
-                        best_cap_idx = cap_idx
-                        break  # Exit the loop early if text is detected
 
                 # Write the best frame to the output video
                 if best_cap_idx is not None:
-                    video_caps[best_cap_idx].set(cv2.CAP_PROP_POS_FRAMES, i)  # Reset to the correct frame
-                    ret, frame = video_caps[best_cap_idx].read()
-                    if ret:
-                        adjusted_frame = adjust_brightness_contrast(frame, target_brightness, target_contrast, target_hue, target_saturation, target_gamma)
-                        # print(best_cap_idx)
-                        output_video.write(adjusted_frame)
-                        hold_counter = hold_frames - 1  # Adjust hold counter
+                    adjusted_frame = adjust_brightness_contrast(frame, target_brightness, target_contrast, target_hue, target_saturation, target_gamma)
+                    output_video.write(adjusted_frame)
+                    hold_counter = hold_frames - 1  # Adjust hold counter
 
             # Update tqdm progress bar
             pbar.update(1)
