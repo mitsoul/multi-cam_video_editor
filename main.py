@@ -5,6 +5,7 @@ import os
 from tqdm import tqdm
 import argparse
 import pytesseract
+from frame_processing import correction
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Process videos to select the best frames based on pose.")
@@ -102,28 +103,6 @@ def adjust_brightness_contrast(image, target_brightness, target_contrast, target
 
     return cv2.cvtColor(lab_adjusted, cv2.COLOR_LAB2BGR)
 
-    bgr_adjusted = cv2.cvtColor(lab_adjusted, cv2.COLOR_LAB2BGR)
-
-    # Convert to HSV to adjust hue and saturation
-    hsv = cv2.cvtColor(bgr_adjusted, cv2.COLOR_BGR2HSV)
-    h, s, v = cv2.split(hsv)
-
-    # Adjust hue (add a hue shift, target_hue can be small adjustments to hue)
-    # h = np.mod(h.astype(np.float32) + target_hue, 180).astype(np.uint8)
-
-    # Adjust saturation
-    # s = cv2.multiply(s.astype(np.float32), target_saturation).clip(0, 255).astype(np.uint8)
-
-    # Merge adjusted channels and convert back to BGR
-    hsv_adjusted = cv2.merge((h, s, v))
-    bgr_hsv_adjusted = cv2.cvtColor(hsv_adjusted, cv2.COLOR_HSV2BGR)
-
-    # Apply gamma correction
-    # if target_brightness - np.mean(l_channel) < 0:
-    gamma_correction = np.array(255 * (bgr_hsv_adjusted / 255) ** gamma, dtype='uint8')
-
-    return gamma_correction
-
 
 def detect_text(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -148,6 +127,14 @@ def centeredness_score(landmarks, frame_width, frame_height):
     max_distance = np.sqrt(center_x**2 + center_y**2)
     return 1 - (distance / max_distance)
 
+def has_audio(video_file):
+    """Check if a video file has an audio stream using ffmpeg"""
+    import subprocess
+    
+    cmd = ['ffprobe', '-i', video_file, '-show_streams', '-select_streams', 'a', '-loglevel', 'error']
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return bool(result.stdout)
+
 # Function to compute combined score
 def compute_score(landmarks, frame_width, frame_height, frame, target_brightness):
     visibility = visibility_score(landmarks)
@@ -160,6 +147,9 @@ def compute_score(landmarks, frame_width, frame_height, frame, target_brightness
 def process_videos(video_dir, output_path):
     video_files = [os.path.join(video_dir, f) for f in os.listdir(video_dir) if f.endswith('.mp4')]
     video_caps = [cv2.VideoCapture(vf) for vf in video_files]
+
+    # Add angle usage tracking
+    angle_usage_count = {i: 0 for i in range(len(video_caps))}
     
     frame_counts = [int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) for cap in video_caps]
     frame_widths = [int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) for cap in video_caps]
@@ -197,10 +187,12 @@ def process_videos(video_dir, output_path):
         # Iterate over frames
         hold_counter = 0
         best_cap_idx = None
+        current_frame = None
         
-        for i in range(total_frames):  # Loop through synced frames
+        for i in range(total_frames):
             if hold_counter > 0:
-                # Continue using frames from the best video
+                # Continue using the stored best frame index
+                angle_usage_count[best_cap_idx] += 1
                 for cap_idx, cap in enumerate(video_caps):
                     ret, frame = cap.read()
                     if cap_idx == best_cap_idx and ret:
@@ -208,7 +200,11 @@ def process_videos(video_dir, output_path):
                         output_video.write(adjusted_frame)
                 hold_counter -= 1
             else:
+                # Reset best score for new comparison
                 best_score = -float('inf')
+                best_frame = None
+                
+                # Compare all camera angles
                 for cap_idx, cap in enumerate(video_caps):
                     ret, frame = cap.read()
                     if not ret:
@@ -225,15 +221,48 @@ def process_videos(video_dir, output_path):
                     if score > best_score:
                         best_score = score
                         best_cap_idx = cap_idx
+                        best_frame = frame
 
-                # Write the best frame to the output video
-                if best_cap_idx is not None:
-                    adjusted_frame = adjust_brightness_contrast(frame, target_brightness, target_contrast, target_hue, target_saturation, target_gamma)
+                # Write the best frame and reset hold counter
+                if best_frame is not None:
+                    angle_usage_count[best_cap_idx] += 1
+                    adjusted_frame = adjust_brightness_contrast(best_frame, target_brightness, target_contrast, target_hue, target_saturation, target_gamma)
                     output_video.write(adjusted_frame)
-                    hold_counter = hold_frames - 1  # Adjust hold counter
+                    hold_counter = hold_frames - 1
 
-            # Update tqdm progress bar
             pbar.update(1)
+
+    # Find the most used angle that has audio
+    most_used_angle = None
+    max_usage = -1
+    for angle_idx, count in angle_usage_count.items():
+        if count > max_usage and has_audio(video_files[angle_idx]):
+            max_usage = count
+            most_used_angle = angle_idx
+
+    print("\nAngle usage statistics:")
+    for angle_idx, count in angle_usage_count.items():
+        percentage = (count / total_frames) * 100
+        has_audio_str = " (has audio)" if has_audio(video_files[angle_idx]) else " (no audio)"
+        print(f"Angle {angle_idx}: {count} frames ({percentage:.1f}%){has_audio_str}")
+    print(f"\nSelected audio from angle {most_used_angle}")
+
+    # Release all resources before file operations
+    output_video.release()
+    for cap in video_caps:
+        cap.release()
+
+    # Extract and combine video with audio using ffmpeg
+    temp_output = output_path.replace('.mp4', '_temp.mp4')
+    
+    # Make sure the file handles are released before renaming
+    import time
+    time.sleep(1)  # Give the system time to release file handles
+    
+    os.rename(output_path, temp_output)
+    ffmpeg_cmd = f'ffmpeg -i "{temp_output}" -i "{video_files[most_used_angle]}" -c:v copy -map 0:v:0 -map 1:a:0 "{output_path}"'
+    os.system(ffmpeg_cmd)
+    os.remove(temp_output)
 
     # Release all resources
     output_video.release()
