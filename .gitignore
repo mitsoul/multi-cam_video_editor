@@ -2,3 +2,4 @@ venv/
 *.mp4
 __pycache__/
 frame_processing.py
+logs/
