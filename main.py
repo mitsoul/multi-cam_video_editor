@@ -23,7 +23,22 @@ def parse_arguments():
     parser = argparse.ArgumentParser(description="Process videos to select the best frames based on pose.")
     parser.add_argument('input_dir', type=str, help='Path to the input video directory')
     parser.add_argument('output_path', type=str, help='Path to the output video file')
+    parser.add_argument('--cuts_json', type=str, help='Path to JSON file containing predefined cuts (optional)')
+    parser.add_argument('--adjustment_mode', type=str, choices=['manual', 'auto', 'none'], 
+                       default='auto', help='Choose between manual, automatic, or no brightness/contrast adjustment')
     return parser.parse_args()
+
+def parse_timestamp(timestamp):
+    """Convert HH:MM:SS.mmm format to seconds"""
+    hours, minutes, seconds = timestamp.split(':')
+    seconds, milliseconds = seconds.split('.')
+    total_seconds = (
+        int(hours) * 3600 + 
+        int(minutes) * 60 + 
+        int(seconds) + 
+        int(milliseconds) / 1000
+    )
+    return total_seconds
 
 # Initialize MediaPipe Pose
 mp_pose = mp.solutions.pose
@@ -33,52 +48,91 @@ def create_adjustment_window(angle_idx):
     """Create window with trackbars for brightness and contrast adjustment"""
     window_name = f'Adjust Angle {angle_idx}'
     cv2.namedWindow(window_name)
-    # Initialize with neutral values
-    cv2.createTrackbar('Brightness', window_name, 0, 200, lambda x: None)  # -100 to +100
-    cv2.createTrackbar('Contrast', window_name, 100, 200, lambda x: None)  # 0 to 2.0
+    # Initialize with neutral values (100 is center/neutral)
+    cv2.createTrackbar('Brightness', window_name, 100, 200, lambda x: None)  # 0-200 maps to -100 to +100
+    cv2.createTrackbar('Contrast', window_name, 100, 200, lambda x: None)    # 0-200 maps to 0-2.0
     return window_name
 
 def adjust_frame(frame, brightness, contrast):
-    """Apply brightness and contrast adjustments to frame"""
-    brightness = brightness - 100  # Convert from 0-200 to -100-100
-    contrast = contrast / 100.0    # Convert from 0-200 to 0-2.0
+    """
+    Enhanced frame adjustment using CLAHE and traditional brightness/contrast
+    """
+    # Convert to LAB color space
+    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
     
-    adjusted = frame.astype(float)
-    adjusted = contrast * adjusted + brightness
-    adjusted = np.clip(adjusted, 0, 255)
-    return adjusted.astype(np.uint8)
+    # Apply CLAHE to L channel
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    cl = clahe.apply(l)
+    
+    # Merge channels
+    limg = cv2.merge((cl, a, b))
+    
+    # Convert back to BGR
+    enhanced = cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
+    
+    # Apply additional brightness/contrast adjustments if needed
+    alpha = contrast / 100.0  # Contrast (0-2)
+    beta = brightness - 100   # Brightness (-100 to +100)
+    
+    # Apply contrast and brightness using cv2's convertScaleAbs
+    final = cv2.convertScaleAbs(enhanced, alpha=alpha, beta=beta)
+    return final
 
 def get_manual_adjustments(sample_frames):
     """Interactive window for manual brightness/contrast adjustment"""
-    adjustments = {
-        0: {  # Initialize angle 0 with neutral values
-            'brightness': 0,
-            'contrast': 1.0
-        }
+    adjustments = {}
+    
+    # Calculate trackbar-based brightness scores for each frame
+    brightness_scores = []
+    for frame in sample_frames:
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        v_channel = hsv[:,:,2]
+        brightness = np.percentile(v_channel, 90) / 255  # Normalize to 0-1
+        brightness_trackbar = int(np.clip(brightness * 200, 0, 200))
+        brightness_scores.append(brightness_trackbar)
+    
+    # Find the frame with highest trackbar-based brightness score
+    reference_idx = brightness_scores.index(max(brightness_scores))
+    reference_frame = sample_frames[reference_idx]
+    
+    print(f"\nUsing Angle {reference_idx} as reference (brightest frame, score: {brightness_scores[reference_idx]})")
+    print("Adjust each angle's brightness and contrast:")
+    print("- Press 'n' to confirm settings and move to next angle")
+    print("- Press 'q' to cancel adjustment process")
+    cv2.imshow(f'Reference (Angle {reference_idx})', reference_frame)
+    
+    # Initialize reference angle with neutral values
+    adjustments[reference_idx] = {
+        'brightness': 0,    # Neutral brightness adjustment
+        'contrast': 1.0     # Neutral contrast multiplier
     }
-    reference_frame = sample_frames[0]  # Use first angle as reference
-    cv2.imshow('Reference (Angle 0)', reference_frame)
     
     # Create adjustment windows for other angles
-    for i in range(1, len(sample_frames)):
+    for i in range(len(sample_frames)):
+        if i == reference_idx:
+            continue
+            
         window_name = create_adjustment_window(i)
         frame = sample_frames[i]
         
         while True:
+            # Get current trackbar positions
             brightness = cv2.getTrackbarPos('Brightness', window_name)
             contrast = cv2.getTrackbarPos('Contrast', window_name)
             
+            # Show adjusted frame in real-time
             adjusted = adjust_frame(frame, brightness, contrast)
             cv2.imshow(window_name, adjusted)
             
             key = cv2.waitKey(1) & 0xFF
-            if key == ord('n'):  # Press 'n' to move to next angle
+            if key == ord('n'):  # Next angle
                 adjustments[i] = {
                     'brightness': brightness - 100,  # Store as -100 to +100
                     'contrast': contrast / 100.0     # Store as 0.0 to 2.0
                 }
                 break
-            elif key == ord('q'):  # Press 'q' to quit
+            elif key == ord('q'):  # Quit adjustment
                 cv2.destroyAllWindows()
                 return None
     
@@ -86,61 +140,92 @@ def get_manual_adjustments(sample_frames):
     return adjustments
 
 def calculate_brightness_score(frame):
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    avg_brightness = np.mean(gray)
-    # Calculate the score based on brightness (higher brightness = higher score)
-    score = avg_brightness / 255  # Normalize to 0-1 range
-    return score
+    """Calculate perceptual brightness score using HSV Value channel"""
+    # Convert to HSV color space
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    # Use V channel for brightness
+    v_channel = hsv[:, :, 2]
+    return np.mean(v_channel) / 255  # Normalize to 0-1 range
 
 def calculate_target_variables(frames):
-    """
-    Calculate the target brightness, contrast, hue, saturation, and gamma for a set of frames.
-    Returns a dictionary with target values for each video property.
-    """
-    brightness_list = []
-    contrast_list = []
-    hue_list = []
-    saturation_list = []
-    gamma_list = []
-
+    """Calculate target brightness and contrast using CLAHE-enhanced reference frame"""
+    # Find the brightest frame to use as reference
+    brightness_scores = []
     for frame in frames:
-        # Convert to LAB and HSV for brightness/contrast and hue/saturation
+        # Apply CLAHE enhancement before brightness calculation
         lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        cl = clahe.apply(l)
+        
+        brightness = np.percentile(cl, 90) / 255  # Normalize to 0-1
+        brightness_trackbar = int(np.clip(brightness * 200, 0, 200))
+        brightness_scores.append(brightness_trackbar)
+    
+    # Find the frame with highest trackbar-based brightness score
+    reference_idx = brightness_scores.index(max(brightness_scores))
+    reference_frame = frames[reference_idx]
+    
+    reference_hsv = cv2.cvtColor(reference_frame, cv2.COLOR_BGR2HSV)
+    reference_v = reference_hsv[:,:,2]
+    
+    # Modify reference value calculations
+    ref_brightness = np.percentile(reference_v, 90) / 255  # Using 90th percentile
+    # Increase contrast sensitivity and base multiplier
+    ref_contrast = np.std(reference_v) / 64  # Changed from 128 to 64 for more aggressive contrast
+    ref_contrast = np.clip(ref_contrast * 2.5, 0.5, 2.0)  # Increased multiplier from 1.5 
 
-        # Brightness and contrast
-        l_channel, a, b = cv2.split(lab)
-        brightness = np.mean(l_channel)
-        contrast = np.std(l_channel)
-
-        brightness_list.append(brightness)
-        contrast_list.append(contrast)
-
-        # Hue and Saturation
-        h_channel, s_channel, v_channel = cv2.split(hsv)
-        hue = np.mean(h_channel)
-        saturation = np.mean(s_channel)
-
-        hue_list.append(hue)
-        saturation_list.append(saturation)
-
-        # Gamma estimation (assume luminance correlation for simplicity)
-        gamma_list.append(estimate_gamma(frame))
-
-    # Calculate the target as the average for each property
-    target_brightness = np.mean(brightness_list)
-    target_contrast = np.mean(contrast_list)
-    target_hue = np.mean(hue_list)
-    target_saturation = np.mean(saturation_list)
-    target_gamma = np.mean(gamma_list)
-
-    return {
-        'brightness': target_brightness,
-        'contrast': target_contrast,
-        'hue': target_hue,
-        'saturation': target_saturation,
-        'gamma': target_gamma
+    # Convert to trackbar scale
+    ref_brightness_trackbar = int(np.clip(ref_brightness * 200, 0, 200))
+    ref_contrast_trackbar = int(np.clip(ref_contrast * 200, 80, 200))
+    
+    print("\nAnalyzing frame characteristics:")
+    print(f"Reference (Angle {reference_idx} - brightest frame):")
+    print(f"  Brightness: {ref_brightness_trackbar} (trackbar units), {ref_brightness:.3f} (normalized)")
+    print(f"  Contrast: {ref_contrast_trackbar} (trackbar units), {ref_contrast:.3f} (normalized)")
+    
+    adjustments = {}
+    # Set reference angle to neutral values
+    adjustments[reference_idx] = {
+        'brightness': 0,    # Neutral brightness adjustment
+        'contrast': 1.0     # Neutral contrast multiplier
     }
+    
+    # Calculate adjustments for other angles relative to reference
+    for i in range(len(frames)):
+        if i == reference_idx:
+            continue
+            
+        frame = frames[i]
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        v_channel = hsv[:,:,2]
+        
+        # Modify current frame calculations to match reference calculations
+        curr_brightness = np.percentile(v_channel, 90) / 255
+        curr_contrast = np.std(v_channel) / 64  # Match reference calculation
+        curr_contrast = np.clip(curr_contrast * 2.5, 0.5, 2.0)  # Match reference multiplier
+        
+        # Make brightness adjustment more aggressive
+        brightness_diff = (ref_brightness - curr_brightness) * 1.5  # Added multiplier
+        contrast_ratio = ref_contrast / curr_contrast if curr_contrast > 0 else 1.5
+        
+        # Convert to adjustment values with more aggressive scaling
+        brightness_adjustment = int(brightness_diff * 250)  # Increased from 200 to 250
+        contrast_adjustment = contrast_ratio * 1.2  # Added multiplier
+        
+        # Store adjustments with wider ranges
+        adjustments[i] = {
+            'brightness': np.clip(brightness_adjustment, -100, 100),
+            'contrast': np.clip(contrast_adjustment, 0.8, 2.5)  # Increased upper limit from 2.0 to 2.5
+        }
+        
+        # Print analysis for this angle
+        print(f"\nAngle {i}:")
+        print(f"  Original Brightness: {int(curr_brightness * 200)} (trackbar units), {curr_brightness:.3f} (normalized)")
+        print(f"  Original Contrast: {int(curr_contrast * 200)} (trackbar units), {curr_contrast:.3f} (normalized)")
+        print(f"  Adjustment - Brightness: {brightness_adjustment:+d}, Contrast: {contrast_adjustment:.2f}x")
+
+    return adjustments
 
 def estimate_gamma(image):
     """
@@ -214,10 +299,10 @@ def compute_score(landmarks, frame_width, frame_height, frame):
     centeredness = centeredness_score(landmarks, frame_width, frame_height)
     brightness_score = calculate_brightness_score(frame)
     text_score = detect_text(frame) / 100  # Normalize text score (assuming 100 characters is a good benchmark)
-    return visibility * 0.5 + centeredness * 0.2 + brightness_score * 0.6 + text_score * 1.2
+    return visibility * 0.5 + centeredness * 0.2  + text_score * 1.2
 
 # Process the videos
-def process_videos(video_dir, output_path):
+def process_videos(video_dir, output_path, cuts_json=None, adjustment_mode='auto'):
     # Add timestamp tracking
     angle_timestamps = []
     current_time = 0.0
@@ -243,7 +328,7 @@ def process_videos(video_dir, output_path):
     # Track progress with tqdm
     total_frames = min(frame_counts)
     frame_duration = 1 / fps  # Duration of each frame in seconds
-    hold_duration = 3  # Duration to hold the best angle in seconds
+    hold_duration = 5  # Duration to hold the best angle in seconds
     hold_frames = int(hold_duration / frame_duration)  # Number of frames
 
     sample_frames = []
@@ -254,92 +339,139 @@ def process_videos(video_dir, output_path):
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Reset to first frame
 
     # Get manual adjustments for each angle
-    print("\nAdjust brightness and contrast for each angle.")
-    print("Press 'n' to confirm settings for current angle and move to next.")
-    print("Press 'q' to quit adjustment process.")
-    adjustments = get_manual_adjustments(sample_frames)
-    if adjustments is None:
-        print("Adjustment process cancelled.")
-        return
+    if adjustment_mode == 'manual':
+        adjustments = get_manual_adjustments(sample_frames)
+        if adjustments is None:
+            print("Adjustment process cancelled.")
+            return
+    elif adjustment_mode == 'auto':
+        # Calculate automatic adjustments using angle 0 as reference
+        adjustments = calculate_target_variables(sample_frames)
+        print("\nAutomatic adjustments calculated relative to Angle 0")
+    else:  # adjustment_mode == 'none'
+        # Use neutral values for no adjustment
+        adjustments = {
+            i: {
+                'brightness': 0,    # Neutral brightness
+                'contrast': 1.0     # Neutral contrast
+            }
+            for i in range(len(sample_frames))
+        }
+        print("No brightness/contrast adjustments will be applied")
+    
+    if cuts_json:
+        print("yes")
+        with open(cuts_json, 'r') as f:
+            cuts_data = json.load(f)
+            angle_segments = cuts_data.get('angle_segments', [])
+    
+        with tqdm(total=total_frames, desc="Processing Frames", unit="frame", ncols=100) as pbar:
+            frame_idx = 0
+            current_segment_idx = 0
+            
+            while frame_idx < total_frames and current_segment_idx < len(angle_segments):
+                segment = angle_segments[current_segment_idx]
+                current_time = frame_idx / fps
+                segment_start = parse_timestamp(segment['start'])
+                segment_end = parse_timestamp(segment['end'])
+                angle_idx = segment['angle']
 
-    with tqdm(total=total_frames, desc="Processing Frames", unit="frame", ncols=100) as pbar:
-        # Iterate over frames
-        hold_counter = 0
-        best_cap_idx = None
-        current_frame = None
-        last_angle = None
-        segment_start = 0.0
-        
-        for i in range(total_frames):
-            current_time = i / fps
+                if current_time >= segment_start and current_time < segment_end:
+                    # Read and skip frames from all cameras until we get to the right frame
+                    for cap_idx, cap in enumerate(video_caps):
+                        ret, frame = cap.read()
+                        if cap_idx == angle_idx and ret:
+                            brightness = adjustments[cap_idx]['brightness']
+                            contrast = adjustments[cap_idx]['contrast']
+                            adjusted_frame = adjust_frame(frame, brightness + 100, int(contrast * 100))
+                            output_video.write(adjusted_frame)
+                            angle_usage_count[angle_idx] += 1
+                    
+                    frame_idx += 1
+                    pbar.update(1)
+                else:
+                    current_segment_idx += 1
+    
+    else:
+        print("no")
+        with tqdm(total=total_frames, desc="Processing Frames", unit="frame", ncols=100) as pbar:
+            # Iterate over frames
+            hold_counter = 0
+            best_cap_idx = None
+            current_frame = None
+            last_angle = None
+            segment_start = 0.0
+            
+            for i in range(total_frames):
+                current_time = i / fps
 
-            if hold_counter > 0:
-                # Continue using the stored best frame index
-                angle_usage_count[best_cap_idx] += 1
-                for cap_idx, cap in enumerate(video_caps):
-                    ret, frame = cap.read()
-                    if cap_idx == best_cap_idx and ret:
-                        brightness = adjustments[cap_idx]['brightness']
-                        contrast = adjustments[cap_idx]['contrast']
-                        adjusted_frame = adjust_frame(frame, brightness + 100, int(contrast * 100))
-                        output_video.write(adjusted_frame)
-                hold_counter -= 1
-            else:
-                # Reset best score for new comparison
-                best_score = -float('inf')
-                best_frame = None
-                previous_best_cap_idx = best_cap_idx
-                
-                # Compare all camera angles
-                for cap_idx, cap in enumerate(video_caps):
-                    ret, frame = cap.read()
-                    if not ret:
-                        continue
-
-                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    results = pose.process(frame_rgb)
-                    score = 0
-
-                    if results.pose_landmarks:
-                        landmarks = results.pose_landmarks.landmark
-                        score = compute_score(landmarks, frame_widths[cap_idx], frame_heights[cap_idx], frame)
-
-                    if score > best_score:
-                        best_score = score
-                        best_cap_idx = cap_idx
-                        best_frame = frame
-
-                # Write the best frame and reset hold counter
-                if best_frame is not None:
-                    # If we're switching to a new angle or this is the first frame
-                    if best_cap_idx != previous_best_cap_idx or previous_best_cap_idx is None:
-                        # Log the previous segment if it exists
-                        if previous_best_cap_idx is not None:
-                            angle_timestamps.append({
-                                'angle': previous_best_cap_idx,
-                                'start': format_timestamp(segment_start),
-                                'end': format_timestamp(current_time),
-                                'video_file': os.path.basename(video_files[previous_best_cap_idx])
-                            })
-                        segment_start = current_time
-
+                if hold_counter > 0:
+                    # Continue using the stored best frame index
                     angle_usage_count[best_cap_idx] += 1
-                    brightness = adjustments[best_cap_idx]['brightness']
-                    contrast = adjustments[best_cap_idx]['contrast']
-                    adjusted_frame = adjust_frame(best_frame, brightness + 100, int(contrast * 100))
-                    output_video.write(adjusted_frame)
-                    hold_counter = hold_frames - 1
+                    for cap_idx, cap in enumerate(video_caps):
+                        ret, frame = cap.read()
+                        if cap_idx == best_cap_idx and ret:
+                            brightness = adjustments[cap_idx]['brightness']
+                            contrast = adjustments[cap_idx]['contrast']
+                            adjusted_frame = adjust_frame(frame, brightness + 100, int(contrast * 100))
+                            output_video.write(adjusted_frame)
+                    hold_counter -= 1
+                else:
+                    # Reset best score for new comparison
+                    best_score = -float('inf')
+                    best_frame = None
+                    previous_best_cap_idx = best_cap_idx
+                    
+                    # Compare all camera angles
+                    for cap_idx, cap in enumerate(video_caps):
+                        ret, frame = cap.read()
+                        if not ret:
+                            continue
 
-            pbar.update(1)
-        
-        # Log the final segment
-        if best_cap_idx is not None:
-            angle_timestamps.append({
-                'angle': best_cap_idx,
-                'start': format_timestamp(segment_start),
-                'end': format_timestamp(current_time),
-                'video_file': os.path.basename(video_files[best_cap_idx])
-            })
+                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        results = pose.process(frame_rgb)
+                        score = 0
+
+                        if results.pose_landmarks:
+                            landmarks = results.pose_landmarks.landmark
+                            score = compute_score(landmarks, frame_widths[cap_idx], frame_heights[cap_idx], frame)
+
+                        if score > best_score:
+                            best_score = score
+                            best_cap_idx = cap_idx
+                            best_frame = frame
+
+                    # Write the best frame and reset hold counter
+                    if best_frame is not None:
+                        # If we're switching to a new angle or this is the first frame
+                        if best_cap_idx != previous_best_cap_idx or previous_best_cap_idx is None:
+                            # Log the previous segment if it exists
+                            if previous_best_cap_idx is not None:
+                                angle_timestamps.append({
+                                    'angle': previous_best_cap_idx,
+                                    'start': format_timestamp(segment_start),
+                                    'end': format_timestamp(current_time),
+                                    'video_file': os.path.basename(video_files[previous_best_cap_idx])
+                                })
+                            segment_start = current_time
+
+                        angle_usage_count[best_cap_idx] += 1
+                        brightness = adjustments[best_cap_idx]['brightness']
+                        contrast = adjustments[best_cap_idx]['contrast']
+                        adjusted_frame = adjust_frame(best_frame, brightness + 100, int(contrast * 100))
+                        output_video.write(adjusted_frame)
+                        hold_counter = hold_frames - 1
+
+                pbar.update(1)
+            
+            # Log the final segment
+            if best_cap_idx is not None:
+                angle_timestamps.append({
+                    'angle': best_cap_idx,
+                    'start': format_timestamp(segment_start),
+                    'end': format_timestamp(current_time),
+                    'video_file': os.path.basename(video_files[best_cap_idx])
+                })
 
     # Find the most used angle that has audio
     most_used_angle = None
@@ -399,4 +531,4 @@ def process_videos(video_dir, output_path):
 
 if __name__ == "__main__":
     args = parse_arguments()
-    process_videos(args.input_dir, args.output_path)
+    process_videos(args.input_dir, args.output_path, args.cuts_json, args.adjustment_mode)
