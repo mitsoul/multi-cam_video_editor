@@ -139,6 +139,48 @@ def get_manual_adjustments(sample_frames):
     cv2.destroyAllWindows()
     return adjustments
 
+def calculate_target_values(reference_frame):
+    """Calculate target brightness and contrast values from a reference frame"""
+    # Convert to LAB and calculate CLAHE-enhanced brightness
+    lab = cv2.cvtColor(reference_frame, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    cl = clahe.apply(l)
+    
+    # Calculate target values using enhanced L channel
+    target_brightness = np.percentile(cl, 90) / 255  # Using 90th percentile
+    target_contrast = np.std(cl) / 64  # More aggressive contrast
+    target_contrast = np.clip(target_contrast * 2.5, 0.5, 2.0)
+    
+    return target_brightness, target_contrast
+
+def adjust_frame_to_reference(frame, reference_frame):
+    """Adjust frame's brightness and contrast to match reference frame"""
+    target_brightness, target_contrast = calculate_target_values(reference_frame)
+    
+    # Calculate current frame values
+    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    cl = clahe.apply(l)
+    
+    curr_brightness = np.percentile(cl, 90) / 255
+    curr_contrast = np.std(cl) / 64
+    curr_contrast = np.clip(curr_contrast * 2.5, 0.5, 2.0)
+    
+    # Calculate adjustments
+    brightness_diff = (target_brightness - curr_brightness) * 1.5
+    contrast_ratio = target_contrast / curr_contrast if curr_contrast > 0 else 1.5
+    
+    # Convert to adjustment parameters
+    brightness_adjustment = int(brightness_diff * 250)
+    contrast_adjustment = contrast_ratio * 1.2
+    
+    # Apply adjustments using existing adjust_frame function
+    return adjust_frame(frame, 
+                       np.clip(brightness_adjustment + 100, 0, 200),
+                       int(np.clip(contrast_adjustment * 100, 80, 200)))
+
 def calculate_brightness_score(frame):
     """Calculate perceptual brightness score using HSV Value channel"""
     # Convert to HSV color space
@@ -340,6 +382,40 @@ def process_videos(video_dir, output_path, cuts_json=None, adjustment_mode='auto
                 frames.append((idx, frame))
         return frames if len(frames) == len(video_caps) else None
     
+    # # Add detailed video information printing
+    # print("\nVideo Information:")
+    # print("-" * 50)
+    # for idx, (video_file, cap) in enumerate(zip(video_files, video_caps)):
+    #     fps = cap.get(cv2.CAP_PROP_FPS)
+    #     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    #     duration = frame_count / fps if fps > 0 else 0
+        
+    #     print(f"\nVideo {idx}: {os.path.basename(video_file)}")
+    #     print(f"  Frame Rate: {fps:.2f} fps")
+    #     print(f"  Frame Count: {frame_count:,}")
+    #     print(f"  Duration: {duration:.2f} seconds ({duration/60:.2f} minutes)")
+    #     print(f"  Resolution: {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
+        
+    #     # Verify frame rate consistency by sampling
+    #     timestamps = []
+    #     for _ in range(min(100, frame_count)):  # Sample first 100 frames
+    #         cap.read()
+    #         timestamps.append(cap.get(cv2.CAP_PROP_POS_MSEC))
+        
+    #     if len(timestamps) > 1:
+    #         frame_intervals = [j-i for i, j in zip(timestamps[:-1], timestamps[1:])]
+    #         avg_interval = sum(frame_intervals) / len(frame_intervals)
+    #         measured_fps = 1000 / avg_interval if avg_interval > 0 else 0
+    #         print(f"  Measured Frame Rate: {measured_fps:.2f} fps")
+            
+    #         if abs(measured_fps - fps) > 1:
+    #             print(f"  ⚠️ Warning: Reported FPS ({fps:.2f}) differs from measured FPS ({measured_fps:.2f})")
+        
+    #     # Reset video capture to start
+    #     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    
+    # print("\n" + "-" * 50)
+
     # Add angle usage tracking
     angle_usage_count = {i: 0 for i in range(len(video_caps))}
 
@@ -371,6 +447,22 @@ def process_videos(video_dir, output_path, cuts_json=None, adjustment_mode='auto
         if ret:
             sample_frames.append(frame)
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Reset to first frame
+
+    # Find reference angle (brightest frame) using existing method
+    reference_angle = None
+    brightness_scores = []
+    for frame in sample_frames:
+        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        cl = clahe.apply(l)
+        
+        brightness = np.percentile(cl, 90) / 255
+        brightness_trackbar = int(np.clip(brightness * 200, 0, 200))
+        brightness_scores.append(brightness_trackbar)
+    
+    reference_angle = brightness_scores.index(max(brightness_scores))
+    print(f"\nUsing Angle {reference_angle} as reference for dynamic adjustments")
 
     # Get manual adjustments for each angle
     if adjustment_mode == 'manual':
@@ -413,11 +505,15 @@ def process_videos(video_dir, output_path, cuts_json=None, adjustment_mode='auto
                 if current_time >= segment_start and current_time < segment_end:
                     frames = read_synchronized_frames()
                     if frames:
+                        reference_frame = None
+                        for cap_idx, frame in frames:
+                            if cap_idx == reference_angle:  # Use determined reference angle
+                                reference_frame = frame
+                                break
+                                
                         for cap_idx, frame in frames:
                             if cap_idx == angle_idx:
-                                brightness = adjustments[cap_idx]['brightness']
-                                contrast = adjustments[cap_idx]['contrast']
-                                adjusted_frame = adjust_frame(frame, brightness + 100, int(contrast * 100))
+                                adjusted_frame = adjust_frame_to_reference(frame, reference_frame)
                                 output_video.write(adjusted_frame)
                                 angle_usage_count[angle_idx] += 1
                     frame_idx += 1
@@ -438,13 +534,17 @@ def process_videos(video_dir, output_path, cuts_json=None, adjustment_mode='auto
                 if hold_counter > 0:
                     frames = read_synchronized_frames()
                     if frames:
+                        reference_frame = None
                         for cap_idx, frame in frames:
-                            if cap_idx == best_cap_idx:
-                                brightness = adjustments[cap_idx]['brightness']
-                                contrast = adjustments[cap_idx]['contrast']
-                                adjusted_frame = adjust_frame(frame, brightness + 100, int(contrast * 100))
+                            if cap_idx == reference_angle:  # Use determined reference angle
+                                reference_frame = frame
+                                break
+                                
+                        for cap_idx, frame in frames:
+                            if cap_idx == angle_idx:
+                                adjusted_frame = adjust_frame_to_reference(frame, reference_frame)
                                 output_video.write(adjusted_frame)
-                                angle_usage_count[best_cap_idx] += 1
+                                angle_usage_count[angle_idx] += 1
                     hold_counter -= 1
                 else:
                     best_score = -float('inf')
@@ -466,13 +566,16 @@ def process_videos(video_dir, output_path, cuts_json=None, adjustment_mode='auto
                                 best_cap_idx = cap_idx
                                 best_frame = frame
 
+                        reference_frame = None
+                        for cap_idx, frame in frames:
+                            if cap_idx == reference_angle:  # Use determined reference angle
+                                reference_frame = frame
+                                break
+                                
                         if best_frame is not None:
-                            brightness = adjustments[best_cap_idx]['brightness']
-                            contrast = adjustments[best_cap_idx]['contrast']
-                            adjusted_frame = adjust_frame(best_frame, brightness + 100, int(contrast * 100))
+                            adjusted_frame = adjust_frame_to_reference(best_frame, reference_frame)
                             output_video.write(adjusted_frame)
                             angle_usage_count[best_cap_idx] += 1
-                            hold_counter = hold_frames - 1
 
                 pbar.update(1)
             

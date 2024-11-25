@@ -137,3 +137,107 @@ def adjust_brightness_contrast(image, target_brightness, target_contrast):
     adjusted_image = cv2.cvtColor(adjusted_image_data, cv2.COLOR_RGB2BGR)
     
     return adjusted_image
+
+
+def calculate_target_values(reference_frame):
+    """Calculate target brightness and contrast values from a reference frame"""
+    # Convert to LAB and calculate CLAHE-enhanced brightness
+    lab = cv2.cvtColor(reference_frame, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    cl = clahe.apply(l)
+    
+    # Calculate target values using enhanced L channel
+    target_brightness = np.percentile(cl, 90) / 255  # Using 90th percentile
+    target_contrast = np.std(cl) / 64  # More aggressive contrast
+    target_contrast = np.clip(target_contrast * 2.5, 0.5, 2.0)
+    
+    return target_brightness, target_contrast
+
+def adjust_frame_to_reference(frame, reference_frame):
+    """Adjust frame's brightness and contrast to match reference frame"""
+    target_brightness, target_contrast = calculate_target_values(reference_frame)
+    
+    # Calculate current frame values
+    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    cl = clahe.apply(l)
+    
+    curr_brightness = np.percentile(cl, 90) / 255
+    curr_contrast = np.std(cl) / 64
+    curr_contrast = np.clip(curr_contrast * 2.5, 0.5, 2.0)
+    
+    # Calculate adjustments
+    brightness_diff = (target_brightness - curr_brightness) * 1.5
+    contrast_ratio = target_contrast / curr_contrast if curr_contrast > 0 else 1.5
+    
+    # Convert to adjustment parameters
+    brightness_adjustment = int(brightness_diff * 250)
+    contrast_adjustment = contrast_ratio * 1.2
+    
+    # Apply adjustments using existing adjust_frame function
+    return adjust_frame(frame, 
+                       np.clip(brightness_adjustment + 100, 0, 200),
+                       int(np.clip(contrast_adjustment * 100, 80, 200)))
+
+
+def get_manual_adjustments(sample_frames):
+    """Interactive window for manual brightness/contrast adjustment"""
+    adjustments = {}
+    
+    # Calculate trackbar-based brightness scores for each frame
+    brightness_scores = []
+    for frame in sample_frames:
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        v_channel = hsv[:,:,2]
+        brightness = np.percentile(v_channel, 90) / 255  # Normalize to 0-1
+        brightness_trackbar = int(np.clip(brightness * 200, 0, 200))
+        brightness_scores.append(brightness_trackbar)
+    
+    # Find the frame with highest trackbar-based brightness score
+    reference_idx = brightness_scores.index(max(brightness_scores))
+    reference_frame = sample_frames[reference_idx]
+    
+    print(f"\nUsing Angle {reference_idx} as reference (brightest frame, score: {brightness_scores[reference_idx]})")
+    print("Adjust each angle's brightness and contrast:")
+    print("- Press 'n' to confirm settings and move to next angle")
+    print("- Press 'q' to cancel adjustment process")
+    cv2.imshow(f'Reference (Angle {reference_idx})', reference_frame)
+    
+    # Initialize reference angle with neutral values
+    adjustments[reference_idx] = {
+        'brightness': 0,    # Neutral brightness adjustment
+        'contrast': 1.0     # Neutral contrast multiplier
+    }
+    
+    # Create adjustment windows for other angles
+    for i in range(len(sample_frames)):
+        if i == reference_idx:
+            continue
+            
+        window_name = create_adjustment_window(i)
+        frame = sample_frames[i]
+        
+        while True:
+            # Get current trackbar positions
+            brightness = cv2.getTrackbarPos('Brightness', window_name)
+            contrast = cv2.getTrackbarPos('Contrast', window_name)
+            
+            # Show adjusted frame in real-time
+            adjusted = adjust_frame(frame, brightness, contrast)
+            cv2.imshow(window_name, adjusted)
+            
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('n'):  # Next angle
+                adjustments[i] = {
+                    'brightness': brightness - 100,  # Store as -100 to +100
+                    'contrast': contrast / 100.0     # Store as 0.0 to 2.0
+                }
+                break
+            elif key == ord('q'):  # Quit adjustment
+                cv2.destroyAllWindows()
+                return None
+    
+    cv2.destroyAllWindows()
+    return adjustments
