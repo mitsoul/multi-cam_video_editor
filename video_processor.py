@@ -51,14 +51,79 @@ def compute_score(landmarks, frame_width, frame_height, frame):
     text_score = detect_text(frame) / 100  # Normalize text score (assuming 100 characters is a good benchmark)
     return visibility * 0.5 + centeredness * 0.2  + text_score * 1.2
 
+def generate_editing_script(angle_timestamps, video_files, output_path):
+        # Extract lecture number from the first video filename
+        import re
+        first_file = os.path.basename(video_files[0])
+        match = re.search(r'(\d+)\.701', first_file)
+        lec_num = int(match.group(1)) if match else 1
+
+        # Map video indices to their types based on filename
+        angle_types = {}
+        for idx, file in enumerate(video_files):
+            filename = os.path.basename(file).lower()
+            if 'left' in filename:
+                angle_types[idx] = 'left'
+            elif 'center' in filename:
+                angle_types[idx] = 'center'
+            elif 'wide' in filename:
+                angle_types[idx] = 'wide'
+            elif 'tracking' in filename:
+                angle_types[idx] = 'tracking'
+            elif 'pc' in filename:
+                angle_types[idx] = 'pc'
+
+        script = [
+            f"lec_num = {lec_num}",
+            "prefix = \"videos/\"",
+            f"left_source = prefix + f\"dcai_lec{{lec_num:02d}}_left.mp4\"",
+            f"center_source = prefix + f\"dcai_lec{{lec_num:02d}}_center.mp4\"",
+            f"wide_source = prefix + f\"dcai_lec{{lec_num:02d}}_wide.mp4\"",
+            f"tracking_source = prefix + f\"dcai_lec{{lec_num:02d}}_tracking.mp4\"",
+            f"pc_source = prefix + f\"dcai_lec{{lec_num:02d}}_pc.mp4\"",
+            f"audio_source = prefix + f\"dcai_lec{{lec_num:02d}}_tracking.mp4\"",
+            "",
+            "left = Fullscreen(left_source, delay=-17/30)",
+            "center = Fullscreen(center_source, delay=-12/30)",
+            "pc = Fullscreen(pc_source, delay=-12/30)",
+            "wide = Fullscreen(wide_source, delay=1/30)",
+            "tracking = Fullscreen(tracking_source, delay=0/30)",
+            "pc_and_tracking = Overlay(pc, tracking, crop_x = 0, crop_y = 0, crop_width = 1920, location = Location.TOP_RIGHT, width = 270, margin = 10)",
+            "audio = Audio(audio_source, delay=1/30)",
+            "",
+            "Multitrack([",
+        ]
+
+        # Add clips based on angle_timestamps
+        clips = []
+        for segment in angle_timestamps:
+            angle = segment['angle']
+            if angle in angle_types:
+                angle_name = angle_types[angle]
+                source = angle_name if angle_name != 'pc' else 'pc_and_tracking'
+                clips.append(f"    Clip({source}, start=\"{segment['start']}\"{', end=\"' + segment['end'] + '\"' if segment == angle_timestamps[-1] else ''})")
+
+        script.extend(clips)
+        script.extend([
+            "    ], audio).render(f\"dcai_lec{lec_num:02d}.mp4\")"
+        ])
+
+        return "\n".join(script)
+
 # Process the videos
 def process_videos(video_dir, output_path, cuts_json=None, adjustment_mode='auto'):
     # Add timestamp tracking
     angle_timestamps = []
     current_time = 0.0
+    segment_start = 0.0  # Add this at the beginning
+    current_angle = None  # Add this to track the current angle
 
     video_files = [os.path.join(video_dir, f) for f in os.listdir(video_dir) if f.endswith('.mp4')]
     video_caps = [cv2.VideoCapture(vf) for vf in video_files]
+
+    # Update script output path to use video_editor/logs directory
+    script_output_path = os.path.join('logs', os.path.basename(output_path).replace('.mp4', '_script.py'))
+    os.makedirs(os.path.dirname(script_output_path), exist_ok=True)  # Ensure directory exists
 
     # Get FPS for all videos
     fps_values = [cap.get(cv2.CAP_PROP_FPS) for cap in video_caps]
@@ -136,10 +201,22 @@ def process_videos(video_dir, output_path, cuts_json=None, adjustment_mode='auto
             
             while frame_idx < total_frames and current_segment_idx < len(angle_segments):
                 segment = angle_segments[current_segment_idx]
-                current_time = frame_idx / target_fps  # Use target_fps here
+                current_time = frame_idx / target_fps
                 segment_start = parse_timestamp(segment['start'])
                 segment_end = parse_timestamp(segment['end'])
                 angle_idx = segment['angle']
+
+                # Add timestamp tracking for cuts_json mode
+                if current_angle != angle_idx:
+                    if current_angle is not None:
+                        angle_timestamps.append({
+                            'angle': current_angle,
+                            'start': format_timestamp(segment_start),
+                            'end': format_timestamp(current_time),
+                            'video_file': os.path.basename(video_files[current_angle])
+                        })
+                    current_angle = angle_idx
+                    segment_start = current_time
 
                 if current_time >= segment_start and current_time < segment_end:
                     frames = read_synchronized_frames()
@@ -161,7 +238,6 @@ def process_videos(video_dir, output_path, cuts_json=None, adjustment_mode='auto
         with tqdm(total=total_frames, desc="Processing Frames", unit="frame", ncols=100) as pbar:
             hold_counter = 0
             best_cap_idx = None
-            segment_start = 0.0
             
             for i in range(total_frames):
                 current_time = i / target_fps
@@ -198,6 +274,18 @@ def process_videos(video_dir, output_path, cuts_json=None, adjustment_mode='auto
                                 best_frame = frame
 
                         if best_frame is not None:
+                        # Add timestamp tracking for automatic mode
+                            if current_angle != best_cap_idx:
+                                if current_angle is not None:
+                                    angle_timestamps.append({
+                                        'angle': current_angle,
+                                        'start': format_timestamp(segment_start),
+                                        'end': format_timestamp(current_time),
+                                        'video_file': os.path.basename(video_files[current_angle])
+                                    })
+                                current_angle = best_cap_idx
+                                segment_start = current_time
+
                             brightness = adjustments[best_cap_idx]['brightness']
                             contrast = adjustments[best_cap_idx]['contrast']
                             adjusted_frame = adjust_frame(best_frame, brightness + 100, int(contrast * 100))
@@ -207,14 +295,14 @@ def process_videos(video_dir, output_path, cuts_json=None, adjustment_mode='auto
 
                 pbar.update(1)
             
-            # Log the final segment
-            if best_cap_idx is not None:
-                angle_timestamps.append({
-                    'angle': best_cap_idx,
-                    'start': format_timestamp(segment_start),
-                    'end': format_timestamp(current_time),
-                    'video_file': os.path.basename(video_files[best_cap_idx])
-                })
+            # # Log the final segment
+            # if best_cap_idx is not None:
+            #     angle_timestamps.append({
+            #         'angle': best_cap_idx,
+            #         'start': format_timestamp(segment_start),
+            #         'end': format_timestamp(current_time),
+            #         'video_file': os.path.basename(video_files[best_cap_idx])
+            #     })
 
     # Find the most used angle that has audio
     most_used_angle = None
@@ -268,6 +356,19 @@ def process_videos(video_dir, output_path, cuts_json=None, adjustment_mode='auto
             for angle, count in angle_usage_count.items()
         }
     }
+
+    # Add the final segment before finishing
+    if current_angle is not None:
+        angle_timestamps.append({
+            'angle': current_angle,
+            'start': format_timestamp(segment_start),
+            'end': format_timestamp(current_time),
+            'video_file': os.path.basename(video_files[current_angle])
+        })
+
+    script_content = generate_editing_script(angle_timestamps, video_files, output_path)
+    with open(script_output_path, 'w') as f:
+        f.write(script_content)
     
     with open(log_file, 'w') as f:
         json.dump(log_data, f, indent=2)
